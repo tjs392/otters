@@ -1,14 +1,14 @@
 use pyo3::prelude::*;
+
+mod compute;
+mod batcher;
+mod builtins;
+mod sources;
+mod sinks;
 mod pipeline;
 
-#[pymodule(gil_used = false)]
-mod otters {
-    use pyo3::prelude::*;
-    use crate::pipeline::Pipeline;
-
-    #[pymodule_init]
-    fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
-        m.add_class::<Pipeline>()?;
-        Ok(())
-    }
+#[pymodule]
+fn otters(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<pipeline::Pipeline>()?;
+    Ok(())
 }

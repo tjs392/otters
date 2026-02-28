@@ -9,5 +9,7 @@ name = "otters"
 crate-type = ["cdylib"]
 
 [dependencies]
+arrow = { version = "58.0.0", features = ["pyarrow"] }
 crossbeam-channel = "0.5.15"
-pyo3 = "0.27.0"
+parquet = { version = "58.0.0", features = ["arrow"] }
+pyo3 = "0.28.0"

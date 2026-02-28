@@ -1,5 +1,16 @@
+use std::sync::Arc;
 use crossbeam_channel::{Receiver, Sender};
 use pyo3::prelude::*;
+use arrow::record_batch::RecordBatch;
+use arrow::pyarrow::{FromPyArrow, ToPyArrow};
+use crate::compute::ComputeStage;
+use crate::batcher::spawn_batcher;
+use crate::builtins::rolling_mean::RollingMean;
+use crate::builtins::zscore::ZScore;
+use crate::builtins::ema::Ema;
+use crate::builtins::vwap::Vwap;
+use crate::sources::parquet_reader::spawn_parquet_source;
+use crate::sinks::parquet_writer::spawn_parquet_sink;
 
 /// what role a stage plays in the pipeline
 /// 
@@ -10,17 +21,10 @@ use pyo3::prelude::*;
 /// stage  - receives items and transforms via python callback, sends results
 enum StageKind {
     Source(Py<PyAny>),
+    ParquetSource(String),
     Sink(Py<PyAny>),
-    Stage(Compute),
-}
-
-/// the computation a middle stage performs
-/// 
-/// PyTransform lets users drop in plain python if they dont want to use a builtin
-enum Compute {
-    RollingMean { column: String, window: usize },
-    ZScore { column: String, lookback: usize },
-    Ema { column: String, span: usize },
+    ParquetSink(String),
+    Stage(Box<dyn ComputeStage + Send + Sync>),
     PyTransform(Py<PyAny>),
 }
 
@@ -53,36 +57,40 @@ pub struct Pipeline {
 #[pymethods]
 impl Pipeline {
     #[new]
-    #[pyo3(signature = (capacity=1024, batch_size=1))]
+    #[pyo3(signature = (capacity=1024, batch_size=2500))]
     pub fn new(capacity: usize, batch_size: usize) -> Pipeline {
-        Pipeline {
-            stages: vec![],
-            capacity,
-            batch_size,
-        }
+        Pipeline { stages: vec![], capacity, batch_size }
     }
 
-    /// registers a source stage
-    /// example:
-    ///   def source():
-    ///       for row in csv.reader(f):
-    ///           yield {"price": float(row[0]), ...}
-    ///   p.source(source)
-    fn source(&mut self, callback: Py<PyAny>) {
+    fn source(&mut self, src: Py<PyAny>, py: Python<'_>) {
+        if let Ok(s) = src.extract::<String>(py) {
+            if s.ends_with(".parquet") {
+                self.stages.push(StageConfig {
+                    kind: StageKind::ParquetSource(s),
+                });
+                return;
+            }
+        }
+
+        // fallback: python generator
         self.stages.push(StageConfig {
-            kind: StageKind::Source(callback),
+            kind: StageKind::Source(src),
         });
     }
 
-    /// registers a sink stage
-    /// example:
-    ///   def sink(row):
-    ///       db.insert(row)
-    /// 
-    ///   p.sink(sink)
-    fn sink(&mut self, callback: Py<PyAny>) {
-        self.stages.push(StageConfig { 
-            kind: StageKind::Sink(callback),
+    fn sink(&mut self, target: Py<PyAny>, py: Python<'_>) {
+        if let Ok(s) = target.extract::<String>(py) {
+            if s.ends_with(".parquet") {
+                self.stages.push(StageConfig {
+                    kind: StageKind::ParquetSink(s),
+                });
+                return;
+            }
+        }
+
+        // fallback: python callable
+        self.stages.push(StageConfig {
+            kind: StageKind::Sink(target),
         });
     }
 
@@ -90,27 +98,30 @@ impl Pipeline {
 
     fn rolling_mean(&mut self, column: String, window: usize) {
         self.stages.push(StageConfig {
-            kind: StageKind::Stage(Compute::RollingMean { column, window }),
-        })
+            kind: StageKind::Stage(Box::new(RollingMean::new(column, window))),
+        });
     }
 
     fn zscore(&mut self, column: String, lookback: usize) {
         self.stages.push(StageConfig {
-            kind: StageKind::Stage(Compute::ZScore { column, lookback }),
+            kind: StageKind::Stage(Box::new(ZScore::new(column, lookback))),
         });
     }
 
     fn ema(&mut self, column: String, span: usize) {
         self.stages.push(StageConfig {
-            kind: StageKind::Stage(Compute::Ema { column, span }),
+            kind: StageKind::Stage(Box::new(Ema::new(column, span))),
         });
     }
 
-    /// custom python transform
-    fn py_transform(&mut self, callback: Py<PyAny>) {
+    fn vwap(&mut self, price_col: String, volume_col: String, window: usize) {
         self.stages.push(StageConfig {
-            kind: StageKind::Stage(Compute::PyTransform(callback)),
+            kind: StageKind::Stage(Box::new(Vwap::new(price_col, volume_col, window))),
         });
+    }
+
+    fn py_transform(&mut self, callback: Py<PyAny>) {
+        self.stages.push(StageConfig { kind: StageKind::PyTransform(callback) });
     }
 
     /// wires up channels between stages, spawns workers threads, and
@@ -118,132 +129,137 @@ impl Pipeline {
     /// 
     /// must give py so can release GIL while waiting
     fn run(&mut self, py: Python<'_>) {
-        
-        // take ownership by draining
         let stages: Vec<StageConfig> = self.stages.drain(..).collect();
         let mut handles = Vec::new();
-
-        // need to copy primitives out of self so we dont borrow across threads
         let capacity = self.capacity;
         let batch_size = self.batch_size;
 
-        let mut senders: Vec<Option<Sender<Py<PyAny>>>> = Vec::new();
-        let mut receivers: Vec<Option<Receiver<Py<PyAny>>>> = Vec::new();
+        let has_parquet_source = stages.iter()
+            .any(|s| matches!(s.kind, StageKind::ParquetSource(_)));
 
-        let n = stages.len();
-        for _ in 0..n - 1 {
-            let (s, r) = crossbeam_channel::bounded(capacity);
-            senders.push(Some(s));
-            receivers.push(Some(r));
+        let rust_stage_count = stages.iter()
+            .filter(|s| matches!(s.kind, StageKind::Stage(_) | StageKind::PyTransform(_)))
+            .count();
+
+        // batch channels: enough for all rust stages + 1 for source output
+        let mut batch_senders: Vec<Option<Sender<RecordBatch>>> = Vec::new();
+        let mut batch_receivers: Vec<Option<Receiver<RecordBatch>>> = Vec::new();
+        for _ in 0..rust_stage_count + 1 {
+            let (s, r) = crossbeam_channel::bounded::<RecordBatch>(capacity);
+            batch_senders.push(Some(s));
+            batch_receivers.push(Some(r));
         }
 
-        for (i, config) in stages.into_iter().enumerate() {
+        // dict channel only needed for python generator source
+        let dict_channel = if !has_parquet_source {
+            let (tx, rx) = crossbeam_channel::bounded::<Py<PyAny>>(capacity);
+            Some((tx, rx))
+        } else {
+            None
+        };
+        let mut dict_tx_opt = dict_channel.as_ref().map(|(tx, _)| Some(tx.clone()));
+        let mut dict_rx_opt = dict_channel.map(|(_, rx)| Some(rx));
+
+        let mut batch_chan_idx = 0usize;
+
+        for config in stages.into_iter() {
             match config.kind {
+                StageKind::ParquetSource(path) => {
+                    // writes directly into batch_channels[0], no batcher needed!! also go GIL needed!
+                    let sender = batch_senders[0].take().unwrap();
+                    batch_chan_idx = 1;
+                    handles.push(spawn_parquet_source(path, sender, batch_size));
+                }
+
                 StageKind::Source(cb) => {
-                    // source should always be stage 0
-                    let sender = senders[0].take().unwrap();
+                    let dict_tx = dict_tx_opt.as_mut().unwrap().take().unwrap();
+                    let dict_rx = dict_rx_opt.as_mut().unwrap().take().unwrap();
+
                     handles.push(std::thread::spawn(move || {
-                        // call the python factory once to get the iter obj
-                        // this aquires GIL for a sec, then releases it
                         let iter = Python::attach(|py| cb.call0(py).unwrap());
-                        
-                        // acquire GIL per item so other threads can run python between items.
-                        // if we held the GIL across the whole loop an infinite source would
-                        // starve every other stage that needs to call python.
                         loop {
                             match Python::attach(|py| iter.call_method0(py, "__next__")) {
-                                Ok(item) => { sender.send(item).ok(); }
+                                Ok(item) => { dict_tx.send(item).ok(); }
                                 Err(_) => break,
                             }
                         }
                     }));
+
+                    let batcher_tx = batch_senders[0].take().unwrap();
+                    handles.push(spawn_batcher(dict_rx, batcher_tx, batch_size));
+                    batch_chan_idx = 1;
                 }
 
-                StageKind::Stage(compute) => {
-                    let receiver = receivers[i - 1].take().unwrap();
-                    let sender = senders[i].take().unwrap();
+                StageKind::Stage(mut compute) => {
+                    let receiver = batch_receivers[batch_chan_idx - 1].take().unwrap();
+                    let sender = batch_senders[batch_chan_idx].take().unwrap();
+                    batch_chan_idx += 1;
 
-                    // GIL is not held here
-                    // Py03 threads dont hold the GIL by default, they acquire it on demand
                     handles.push(std::thread::spawn(move || {
-                        let mut batch = Vec::with_capacity(batch_size);
-                        loop {
-                            
-                            // here just receive until we get to batch size
-                            match receiver.recv() {
-                                Ok(item) => batch.push(item),
-                                Err(_) => break,
-                            }
-
-                            while batch.len() < batch_size {
-                                match receiver.try_recv() {
-                                    Ok(item) => batch.push(item),
-                                    Err(_) => break,
-                                }
-                            }
-
-                            match &compute {
-                                Compute::RollingMean { column, window } => {
-                                    // TODO: nothing for now just placeholder
-                                    todo!("rolling mean not implemented yet")
-                                }
-
-                                // acquire gil and execute the python func if fed in
-                                Compute::PyTransform(cb) => {
-                                    Python::attach(|py| {
-                                        for item in batch.drain(..) {
-                                            let result = cb.call1(py, (item,)).unwrap();
-                                            sender.send(result).ok();
-                                        }
-                                    });
-                                }
-
-                                _ => todo!("not implemented")
-                            }
+                        for batch in receiver.iter() {
+                            let result = compute.process(batch);
+                            sender.send(result).ok();
                         }
                     }));
                 }
 
-                StageKind::Sink(cb) => {
-                    let receiver = receivers[i - 1].take().unwrap();
+                StageKind::PyTransform(cb) => {
+                    let receiver = batch_receivers[batch_chan_idx - 1].take().unwrap();
+                    let sender = batch_senders[batch_chan_idx].take().unwrap();
+                    batch_chan_idx += 1;
+
                     handles.push(std::thread::spawn(move || {
-                        let mut batch = Vec::with_capacity(batch_size);
-                        loop {
-                            match receiver.recv() {
-                                Ok(item) => batch.push(item),
-                                Err(_) => {
-                                    if !batch.is_empty() {
-                                        Python::attach(|py| {
-                                            for item in batch.drain(..) {
-                                                cb.call1(py, (item,)).ok();
-                                            }
-                                        });
-                                    }
-                                    break;
-                                }
-                            }
-
-                            while batch.len() < batch_size {
-                                match receiver.try_recv() {
-                                    Ok(item) => batch.push(item),
-                                    Err(_) => break,
-                                }
-                            }
-
-                            // flush the batch to python's sink callback
+                        for batch in receiver.iter() {
                             Python::attach(|py| {
-                                for item in batch.drain(..) {
-                                    cb.call1(py, (item,)).ok();
+                                let py_batch = batch.to_pyarrow(py).unwrap();
+                                let rows = py_batch.call_method0("to_pylist").unwrap();
+                                let rows_list = rows.cast::<pyo3::types::PyList>().unwrap();
+
+                                let results: Vec<Py<PyAny>> = rows_list.iter()
+                                    .filter_map(|row| {
+                                        let result = cb.call1(py, (row,)).ok()?;
+                                        if result.is_none(py) { None } else { Some(result) }
+                                    })
+                                    .collect();
+
+                                if !results.is_empty() {
+                                    let pa = py.import("pyarrow").unwrap();
+                                    let rb_class = pa.getattr("RecordBatch").unwrap();
+                                    let pylist = pyo3::types::PyList::new(py, &results).unwrap();
+                                    let new_batch: RecordBatch = RecordBatch::from_pyarrow_bound(
+                                        &rb_class.call_method1("from_pylist", (pylist,)).unwrap()
+                                    ).unwrap();
+                                    sender.send(new_batch).ok();
                                 }
                             });
                         }
-                    }))
+                    }));
+                }
+
+                StageKind::ParquetSink(path) => {
+                    // receives RecordBatches directly, writes to parquet - no GIL yaaay
+                    let receiver = batch_receivers[batch_chan_idx - 1].take().unwrap();
+                    handles.push(spawn_parquet_sink(path, receiver));
+                }
+
+                StageKind::Sink(cb) => {
+                    let receiver = batch_receivers[batch_chan_idx - 1].take().unwrap();
+                    handles.push(std::thread::spawn(move || {
+                        for batch in receiver.iter() {
+                            Python::attach(|py| {
+                                let py_batch = batch.to_pyarrow(py).unwrap();
+                                let rows = py_batch.call_method0("to_pylist").unwrap();
+                                let rows_list = rows.cast::<pyo3::types::PyList>().unwrap();
+                                for row in rows_list.iter() {
+                                    cb.call1(py, (row,)).ok();
+                                }
+                            });
+                        }
+                    }));
                 }
             }
         }
 
-        // release the GIL from main thread while waiting for workers
-        // without, spawn threads will never acquire the gil and we deadlock
         py.detach(|| {
             for handle in handles {
                 handle.join().unwrap();
