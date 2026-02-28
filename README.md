@@ -178,6 +178,7 @@ through a sequence of compute stages without loading everything into memory.
 
 ## todo
 
+- look into rust builtins for these calculations because some of them are hard especially with statefulness - want to reduce the points of failure
 - postgress sink and source
 - csv source and sink
 - schema validation at pipeline consturction
